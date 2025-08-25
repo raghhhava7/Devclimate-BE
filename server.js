@@ -2,7 +2,8 @@ import express from 'express'
 import cors from 'cors'
 import dotenv from 'dotenv'
 import { MongoClient, ObjectId } from 'mongodb'
-import { ClerkExpressRequireAuth } from '@clerk/clerk-sdk-node'
+import bcrypt from 'bcrypt'
+import jwt from 'jsonwebtoken'
 
 dotenv.config()
 
@@ -28,20 +29,155 @@ async function connectDB() {
   }
 }
 
+// Auth middleware
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization']
+  const token = authHeader && authHeader.split(' ')[1]
+
+  if (!token) {
+    return res.status(401).json({ error: 'Access token required' })
+  }
+
+  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+    if (err) {
+      return res.status(403).json({ error: 'Invalid or expired token' })
+    }
+    req.user = user
+    next()
+  })
+}
+
 // Routes
 
 // Health check
 app.get('/api/health', (req, res) => {
   res.json({ status: 'OK', message: 'DevClimate API is running' })
 })
-app.use('/',(req,res)=>{
-  res.send("server is running");
+
+app.get('/', (req, res) => {
+  res.send("DevClimate server is running");
 })
+
+// Auth Routes
+// Register new user
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { username, email, password } = req.body
+
+    if (!username || !email || !password) {
+      return res.status(400).json({ error: 'Username, email, and password are required' })
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters long' })
+    }
+
+    // Check if user already exists
+    const existingUser = await db.collection('users').findOne({
+      $or: [{ email }, { username }]
+    })
+
+    if (existingUser) {
+      return res.status(400).json({ error: 'User with this email or username already exists' })
+    }
+
+    // Hash password
+    const saltRounds = 10
+    const hashedPassword = await bcrypt.hash(password, saltRounds)
+
+    // Create user
+    const user = {
+      username,
+      email,
+      password: hashedPassword,
+      createdAt: new Date()
+    }
+
+    const result = await db.collection('users').insertOne(user)
+
+    // Generate JWT token
+    const token = jwt.sign(
+      { userId: result.insertedId, username, email },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    )
+
+    res.status(201).json({
+      message: 'User registered successfully',
+      token,
+      user: { id: result.insertedId, username, email }
+    })
+  } catch (error) {
+    console.error('Registration error:', error)
+    res.status(500).json({ error: 'Failed to register user' })
+  }
+})
+
+// Login user
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body
+
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' })
+    }
+
+    // Find user by email
+    const user = await db.collection('users').findOne({ email })
+
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid email or password' })
+    }
+
+    // Check password
+    const isValidPassword = await bcrypt.compare(password, user.password)
+
+    if (!isValidPassword) {
+      return res.status(401).json({ error: 'Invalid email or password' })
+    }
+
+    // Generate JWT token
+    const token = jwt.sign(
+      { userId: user._id, username: user.username, email: user.email },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    )
+
+    res.json({
+      message: 'Login successful',
+      token,
+      user: { id: user._id, username: user.username, email: user.email }
+    })
+  } catch (error) {
+    console.error('Login error:', error)
+    res.status(500).json({ error: 'Failed to login' })
+  }
+})
+
+// Get current user profile
+app.get('/api/auth/profile', authenticateToken, async (req, res) => {
+  try {
+    const user = await db.collection('users').findOne(
+      { _id: new ObjectId(req.user.userId) },
+      { projection: { password: 0 } }
+    )
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' })
+    }
+
+    res.json({ user })
+  } catch (error) {
+    console.error('Profile error:', error)
+    res.status(500).json({ error: 'Failed to get user profile' })
+  }
+})
+
 // Get current weather for a city (protected route)
-app.get('/api/weather/current/:city', ClerkExpressRequireAuth(), async (req, res) => {
+app.get('/api/weather/current/:city', authenticateToken, async (req, res) => {
   try {
     const { city } = req.params
-    const userId = req.auth.userId
+    const userId = req.user.userId
     
     if (!city) {
       return res.status(400).json({ error: 'City name is required' })
@@ -90,9 +226,9 @@ app.get('/api/weather/current/:city', ClerkExpressRequireAuth(), async (req, res
 })
 
 // Get user's weather searches with pagination (protected route)
-app.get('/api/weather', ClerkExpressRequireAuth(), async (req, res) => {
+app.get('/api/weather', authenticateToken, async (req, res) => {
   try {
-    const userId = req.auth.userId
+    const userId = req.user.userId
     const page = parseInt(req.query.page) || 1
     const limit = parseInt(req.query.limit) || 5
     const skip = (page - 1) * limit
@@ -120,10 +256,10 @@ app.get('/api/weather', ClerkExpressRequireAuth(), async (req, res) => {
 })
 
 // Delete a weather search (protected route)
-app.delete('/api/weather/:searchId', ClerkExpressRequireAuth(), async (req, res) => {
+app.delete('/api/weather/:searchId', authenticateToken, async (req, res) => {
   try {
     const { searchId } = req.params
-    const userId = req.auth.userId
+    const userId = req.user.userId
     
     if (!ObjectId.isValid(searchId)) {
       return res.status(400).json({ error: 'Invalid search ID' })
