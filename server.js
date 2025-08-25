@@ -34,7 +34,9 @@ async function connectDB() {
 app.get('/api/health', (req, res) => {
   res.json({ status: 'OK', message: 'DevClimate API is running' })
 })
-
+app.use('/',(req,res)=>{
+  res.send("server is running");
+})
 // Get current weather for a city (protected route)
 app.get('/api/weather/current/:city', ClerkExpressRequireAuth(), async (req, res) => {
   try {
